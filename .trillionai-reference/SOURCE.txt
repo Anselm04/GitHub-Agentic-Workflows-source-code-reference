@@ -1,0 +1,5 @@
+Upstream: https://github.com/github/gh-aw
+Revision: a1afaae8b8394360de5d4efa39e72e3c2fa59fcd
+Source snapshot; upstream automation, unsupported entries, and restricted enterprise code where applicable excluded. Original licences retained. Commercial reuse requires licence audit.
+Copied files: 11448
+Excluded files: 1020
