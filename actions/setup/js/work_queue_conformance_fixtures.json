@@ -1,0 +1,31 @@
+{
+  "version": 4,
+  "oracle": "Hand-derived canonical codec expectations; neither engine supplies expected results. Dispatch selection fixtures live in specs/work-queue/fixtures/selection.json.",
+  "codec": [
+    {
+      "name": "bytewise Unicode and integer-like object keys",
+      "input": "{\"𐀀\":1,\"\":2,\"2\":2,\"10\":10,\"<>&\":\"<>&\"}",
+      "canonical": "{\"10\":10,\"2\":2,\"<>&\":\"<>&\",\"\":2,\"𐀀\":1}"
+    },
+    {
+      "name": "escaped-equivalent duplicate key",
+      "input": "{\"x\":1,\"\\u0078\":2}",
+      "invalid": true
+    },
+    {
+      "name": "fractional numeric spelling",
+      "input": "{\"x\":1.0}",
+      "invalid": true
+    },
+    {
+      "name": "lossy arbitrary API ID",
+      "input": "{\"run_id\":9007199254740993}",
+      "invalid": true
+    },
+    {
+      "name": "opaque lossless run ID",
+      "input": "{\"run_id\":\"99999999999999999999999999\"}",
+      "canonical": "{\"run_id\":\"99999999999999999999999999\"}"
+    }
+  ]
+}

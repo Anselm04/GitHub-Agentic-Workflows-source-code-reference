@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set +o histexpand
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+  # shellcheck source=assert_docker_lease.sh
+  source "${SCRIPT_DIR}/assert_docker_lease.sh" "" || exit 1
+fi
+
+# Runs an AWF command and retries startup/configuration failures that occur
+# before the engine harness writes its first marker line.
+#
+# Required environment:
+#   GH_AW_AWF_ENGINE_NAME      Engine ID used in retry diagnostics.
+#   GH_AW_AWF_HARNESS_MARKER  Marker emitted by the engine harness, e.g. [claude-harness].
+#   GH_AW_AWF_LOG_FILE        Main agent stdio log file to append to.
+#
+# Optional environment:
+#   GH_AW_AWF_ATTEMPT_LOG_NAME         Safe token used in the temporary attempt log file name.
+#   GH_AW_HARNESS_STARTUP_RETRIES      Shared startup retry budget, 0-2.
+#   GH_AW_CLAUDE_STARTUP_RETRIES       Backward-compatible fallback when the shared budget is unset.
+#   GH_AW_HARNESS_INITIAL_DELAY_MS     Retry delay in milliseconds, rounded up to seconds.
+#   GH_AW_AWF_EXECUTION_COMPONENT      Billable component name (agent, detection, evals).
+#   GH_AW_AWF_EXECUTION_EVIDENCE_FILE  Component execution evidence file to downgrade to
+#                                      "not_started" when AWF never reached the harness.
+
+usage() {
+  echo "Usage: $0 -- <awf-command> [args...]" >&2
+}
+
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+if [ -z "${GH_AW_AWF_ENGINE_NAME:-}" ]; then
+  echo "GH_AW_AWF_ENGINE_NAME is required" >&2
+  exit 2
+fi
+
+if [ -z "${GH_AW_AWF_HARNESS_MARKER:-}" ]; then
+  echo "GH_AW_AWF_HARNESS_MARKER is required" >&2
+  exit 2
+fi
+
+if [ -z "${GH_AW_AWF_LOG_FILE:-}" ]; then
+  echo "GH_AW_AWF_LOG_FILE is required" >&2
+  exit 2
+fi
+
+gh_aw_preflight_script="${SCRIPT_DIR}/harness_retry_runner.cjs"
+if [ ! -f "$gh_aw_preflight_script" ]; then
+  gh_aw_preflight_script="${SCRIPT_DIR}/../js/harness_retry_runner.cjs"
+fi
+if [ -n "${GH_AW_SAFE_OUTPUTS:-}" ] && node "$gh_aw_preflight_script" --preflight-noop; then
+  echo "[${GH_AW_AWF_ENGINE_NAME}-awf-preflight] skipped execution for a pre-existing noop"
+  exit 0
+fi
+
+gh_aw_awf_startup_retries="${GH_AW_HARNESS_STARTUP_RETRIES:-${GH_AW_CLAUDE_STARTUP_RETRIES:-1}}"
+if ! [[ "$gh_aw_awf_startup_retries" =~ ^[0-9]+$ ]]; then
+  gh_aw_awf_startup_retries=1
+fi
+if [ "$gh_aw_awf_startup_retries" -gt 2 ]; then
+  gh_aw_awf_startup_retries=2
+fi
+
+gh_aw_awf_initial_delay_ms="${GH_AW_HARNESS_INITIAL_DELAY_MS:-5000}"
+if ! [[ "$gh_aw_awf_initial_delay_ms" =~ ^[0-9]+$ ]]; then
+  gh_aw_awf_initial_delay_ms=5000
+fi
+
+gh_aw_awf_delay_s=$(((gh_aw_awf_initial_delay_ms + 999) / 1000))
+gh_aw_awf_attempt=0
+gh_aw_awf_backoff_ms=0
+gh_aw_awf_attempt_log_name="${GH_AW_AWF_ATTEMPT_LOG_NAME:-agent}"
+
+# The harness marker is emitted before the engine process is spawned, so its
+# absence proves the engine never ran. That is the same signal the startup
+# retries rely on to re-run the component without double-billing, and it is
+# authoritative proof that no billable inference happened: downgrade the
+# component execution evidence to "not_started" so daily AI credits accounting
+# can count zero instead of failing closed on missing usage files.
+gh_aw_awf_record_execution_not_started() {
+  local evidence_file="${GH_AW_AWF_EXECUTION_EVIDENCE_FILE:-}"
+  local component="${GH_AW_AWF_EXECUTION_COMPONENT:-}"
+  local run_id="${GITHUB_RUN_ID:-}"
+  local run_attempt="${GITHUB_RUN_ATTEMPT:-}"
+  local evidence_tmp
+  if [ -z "$evidence_file" ] || [ -z "$component" ]; then
+    return 0
+  fi
+  if ! [[ "$run_id" =~ ^[0-9]+$ ]] || ! [[ "$run_attempt" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$evidence_file")" || return 0
+  evidence_tmp="${evidence_file}.tmp"
+  printf '{"version":1,"component":"%s","run_id":%s,"run_attempt":%s,"state":"not_started"}\n' \
+    "$component" "$run_id" "$run_attempt" >"$evidence_tmp" || return 0
+  mv "$evidence_tmp" "$evidence_file" || return 0
+  echo "[${GH_AW_AWF_ENGINE_NAME}-awf-retry] AWF failed before the ${GH_AW_AWF_ENGINE_NAME} harness started; recorded ${component} execution evidence as not_started"
+}
+
+while true; do
+  node "$gh_aw_preflight_script" --startup-attempt start "$((gh_aw_awf_attempt + 1))" "$gh_aw_awf_backoff_ms" || true
+  # Legacy workflow commands can be recognized anywhere in a line, including
+  # inside agent JSONL. Pause parsing without changing the captured stream.
+  if ! gh_aw_stop_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" ||
+    ! [[ "$gh_aw_stop_token" =~ ^[[:xdigit:]]{32}$ ]]; then
+    echo "Could not generate a workflow command stop token" >&2
+    node "$gh_aw_preflight_script" --startup-attempt finish "$((gh_aw_awf_attempt + 1))" 1 startup_error || true
+    gh_aw_awf_record_execution_not_started
+    exit 1
+  fi
+  if [ "$GH_AW_AWF_ENGINE_NAME" = "copilot" ]; then
+    # Register the SDK credential on the trusted host before commands are paused.
+    # AWF forwards it via --env-all to the harness and its SDK subprocesses.
+    if ! COPILOT_CONNECTION_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" ||
+      ! [[ "$COPILOT_CONNECTION_TOKEN" =~ ^[[:xdigit:]]{64}$ ]]; then
+      echo "Could not generate a Copilot SDK connection token" >&2
+      node "$gh_aw_preflight_script" --startup-attempt finish "$((gh_aw_awf_attempt + 1))" 1 startup_error || true
+      gh_aw_awf_record_execution_not_started
+      exit 1
+    fi
+    export COPILOT_CONNECTION_TOKEN
+    printf '::add-mask::%s\n' "$COPILOT_CONNECTION_TOKEN"
+  fi
+  gh_aw_awf_attempt_log="$(mktemp "${RUNNER_TEMP:-/tmp}/gh-aw-awf-${gh_aw_awf_attempt_log_name}.XXXXXX")"
+  printf '::stop-commands::%s\n' "$gh_aw_stop_token"
+  "$@" 2>&1 | tee -a "$GH_AW_AWF_LOG_FILE" "$gh_aw_awf_attempt_log"
+  gh_aw_awf_status=${PIPESTATUS[0]}
+  # The subprocess may not have terminated its last line.
+  printf '\n::%s::\n' "$gh_aw_stop_token"
+  if [ "$gh_aw_awf_status" -eq 0 ]; then
+    node "$gh_aw_preflight_script" --startup-attempt finish "$((gh_aw_awf_attempt + 1))" "$gh_aw_awf_status" || true
+    rm -f "$gh_aw_awf_attempt_log"
+    exit 0
+  fi
+  if [ "$gh_aw_awf_status" -eq 78 ] && [ "${GH_AW_MODEL_ROUTING:-}" = "1" ]; then
+    echo "[ERROR] Fatal error: AWF model routing failed (exit code 78); check router diagnostics for no_route or router errors" | tee -a "$GH_AW_AWF_LOG_FILE"
+  fi
+  if { [ "$gh_aw_awf_status" -ne 78 ] || [ "${GH_AW_MODEL_ROUTING:-}" != "1" ]; } &&
+    ! grep -Fq "$GH_AW_AWF_HARNESS_MARKER" "$gh_aw_awf_attempt_log" &&
+    grep -Eqi '(Fatal error:|Process exiting with code:|Refusing to use symlink as bind mountpoint|mcp gateway[^[:cntrl:]]{0,80}(startup failed|failed to start|startup error))' "$gh_aw_awf_attempt_log" &&
+    [ "$gh_aw_awf_attempt" -lt "$gh_aw_awf_startup_retries" ]; then
+    node "$gh_aw_preflight_script" --startup-attempt finish "$((gh_aw_awf_attempt + 1))" "$gh_aw_awf_status" startup_error || true
+    gh_aw_awf_attempt=$((gh_aw_awf_attempt + 1))
+    echo "[${GH_AW_AWF_ENGINE_NAME}-awf-retry] AWF startup failed before ${GH_AW_AWF_ENGINE_NAME} harness; retrying fresh (startup retry ${gh_aw_awf_attempt}/${gh_aw_awf_startup_retries})"
+    rm -f "$gh_aw_awf_attempt_log"
+    sleep "$gh_aw_awf_delay_s"
+    gh_aw_awf_backoff_ms=$((gh_aw_awf_delay_s * 1000))
+    continue
+  fi
+  node "$gh_aw_preflight_script" --startup-attempt finish "$((gh_aw_awf_attempt + 1))" "$gh_aw_awf_status" || true
+  if ! grep -Fq "$GH_AW_AWF_HARNESS_MARKER" "$gh_aw_awf_attempt_log"; then
+    gh_aw_awf_record_execution_not_started
+  fi
+  rm -f "$gh_aw_awf_attempt_log"
+  exit "$gh_aw_awf_status"
+done

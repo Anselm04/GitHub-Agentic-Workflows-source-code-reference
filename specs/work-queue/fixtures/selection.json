@@ -1,0 +1,146 @@
+{
+  "version": 4,
+  "description": "Hand-derived priority-then-FIFO dispatch decisions. Build: one producer submit of `nodes` in order (graph \"graph\", pool \"default\", payload {task: key}, depends_on = work edges to `after` keys); then, when `open` is non-empty, one dispatcher dispatch_next commit claiming exactly the `open` keys in order (ids from claimIdentity(request.id, work_id); parameters pool default, max_claims 256, max_dispatches 256, concurrency 4096, per_account_limit 0, profiles = every node profile). Decide with planDispatch(state, {pool: \"default\", max_claims, max_dispatches, concurrency, per_account_limit, profiles: {name: {workflow: \".github/workflows/<name>.lock.yml\"}}}, \"request:selection-fixture\").",
+  "cases": [
+    {
+      "name": "priority ascending then causal FIFO",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 1, "account": "", "profile": "worker", "after": [] },
+        { "key": "c", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "d", "priority": 2, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": ["b", "d", "a", "c"],
+      "reason": "prefix_complete"
+    },
+    {
+      "name": "FIFO uses submission order, never identity order",
+      "nodes": [
+        { "key": "z", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "m", "priority": 3, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": ["z", "a", "m"],
+      "reason": "prefix_complete"
+    },
+    {
+      "name": "concurrency counts open dispatches of the pool",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "c", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "d", "priority": 3, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": ["a"],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 3, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": ["b", "c"],
+      "reason": "capacity_blocked"
+    },
+    {
+      "name": "a full pool claims nothing",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "c", "priority": 3, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": ["a", "b"],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 2, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": [],
+      "reason": "capacity_blocked"
+    },
+    {
+      "name": "max_claims bounds one request",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "c", "priority": 3, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 2, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": ["a", "b"],
+      "reason": "claim_budget_reached"
+    },
+    {
+      "name": "one Claim per Dispatch: max_dispatches bounds Claims too",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 16, "max_dispatches": 1, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": ["a"],
+      "reason": "claim_budget_reached"
+    },
+    {
+      "name": "per-account limit skips saturated accounts without blocking others",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "x", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "x", "profile": "worker", "after": [] },
+        { "key": "c", "priority": 3, "account": "y", "profile": "worker", "after": [] },
+        { "key": "d", "priority": 3, "account": "x", "profile": "worker", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 1, "profiles": ["worker"] },
+      "expected": ["a", "c"],
+      "reason": "account_capacity_blocked"
+    },
+    {
+      "name": "per-account limit counts already open Claims",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "x", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "x", "profile": "worker", "after": [] },
+        { "key": "c", "priority": 3, "account": "y", "profile": "worker", "after": [] }
+      ],
+      "open": ["a"],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 1, "profiles": ["worker"] },
+      "expected": ["c"],
+      "reason": "prefix_complete"
+    },
+    {
+      "name": "a Work predecessor blocks its dependent until completed",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 1, "account": "", "profile": "worker", "after": ["a"] },
+        { "key": "c", "priority": 3, "account": "", "profile": "worker", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": ["a", "c"],
+      "reason": "prefix_complete"
+    },
+    {
+      "name": "only Work routed to a requested profile is eligible",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "x", "after": [] },
+        { "key": "b", "priority": 3, "account": "", "profile": "y", "after": [] }
+      ],
+      "open": [],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["y"] },
+      "expected": ["b"],
+      "reason": "prefix_complete"
+    },
+    {
+      "name": "available Work that is not eligible",
+      "nodes": [
+        { "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] },
+        { "key": "b", "priority": 3, "account": "", "profile": "worker", "after": ["a"] }
+      ],
+      "open": ["a"],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": [],
+      "reason": "no_eligible_work"
+    },
+    {
+      "name": "no available Work",
+      "nodes": [{ "key": "a", "priority": 3, "account": "", "profile": "worker", "after": [] }],
+      "open": ["a"],
+      "parameters": { "max_claims": 16, "max_dispatches": 16, "concurrency": 16, "per_account_limit": 0, "profiles": ["worker"] },
+      "expected": [],
+      "reason": "no_work"
+    }
+  ]
+}
